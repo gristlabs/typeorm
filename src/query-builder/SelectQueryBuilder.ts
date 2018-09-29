@@ -47,7 +47,8 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
      * Gets generated sql query without parameters being replaced.
      */
     getQuery(): string {
-        let sql = this.createSelectExpression();
+        let sql = this.createWithExpression();
+        sql += this.createSelectExpression();
         sql += this.createJoinExpression();
         sql += this.createWhereExpression();
         sql += this.createGroupByExpression();
@@ -869,6 +870,16 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
     }
 
     /**
+     * Prepends a common table expression to the query.  The expression is expected to be
+     * of the form "WITH ..." and is inserted verbatim (apart from replacing parameters).
+     */
+    with(withClause: string, parameters?: ObjectLiteral) {
+      this.expressionMap.with = withClause;
+      if (parameters) this.setParameters(parameters);
+      return this;
+    }
+
+    /**
      * Adds ORDER BY condition in the query builder.
      */
     addOrderBy(sort: string, order: "ASC"|"DESC" = "ASC", nulls?: "NULLS FIRST"|"NULLS LAST"): this {
@@ -1329,6 +1340,17 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                 subQuery: isSubQuery === true ? subQuery : undefined,
             });
         }
+    }
+
+
+    /**
+     * Creates "WITH" part of SQL query.
+     */
+    protected createWithExpression() {
+        if (this.expressionMap.with) {
+            return this.replacePropertyNames(this.expressionMap.with) + " ";
+        }
+        return "";
     }
 
     /**

@@ -95,4 +95,18 @@ describe("query builder > select", () => {
         expect(sql).to.equal("SELECT post.name FROM post post");
     })));
 
+    it("should allow a WITH clause to be prepended", () => Promise.all(connections.map(async connection => {
+        const [sql, params] = connection.createQueryBuilder(Post, "post")
+            .select(["post.title"])
+            .disableEscaping()
+            .with("WITH cnt(x) AS (VALUES(1),(2),(:last))", {last: 3})
+            .where("post.id in (select * from cnt)")
+            .andWhere("1 = :thing", {thing: 1})
+            .getQueryAndParameters();
+        expect(sql).to.equal("WITH cnt(x) AS (VALUES(1),(2),(?)) " +
+                             "SELECT post.title AS post_title FROM post post " +
+                             "WHERE post.id in (select * from cnt) AND 1 = ?");
+        expect(params).to.deep.equal([3, 1]);
+    })));
+
 });

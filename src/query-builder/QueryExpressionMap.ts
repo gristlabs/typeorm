@@ -117,6 +117,9 @@ export class QueryExpressionMap {
      */
     offset?: number;
 
+    // WITH clause for common table expressions.
+    with?: string;
+
     /**
      * Number of rows to skip of result using pagination.
      */
@@ -377,6 +380,7 @@ export class QueryExpressionMap {
         map.groupBys = this.groupBys.map(groupBy => groupBy);
         map.limit = this.limit;
         map.offset = this.offset;
+        map.with = this.with;
         map.skip = this.skip;
         map.take = this.take;
         map.lockMode = this.lockMode;
