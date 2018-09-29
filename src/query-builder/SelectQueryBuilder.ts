@@ -47,7 +47,12 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
      * Gets generated sql query without parameters being replaced.
      */
     getQuery(): string {
-        let sql = this.createSelectExpression();
+        let sql = "";
+        if (this.expressionMap.prefix) {
+          sql += this.expressionMap.prefix;
+          sql += " ";
+        }
+        sql += this.createSelectExpression();
         sql += this.createJoinExpression();
         sql += this.createWhereExpression();
         sql += this.createGroupByExpression();
@@ -866,6 +871,11 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
             this.expressionMap.orderBys = {};
         }
         return this;
+    }
+
+    prefix(txt: string) {
+      this.expressionMap.prefix = txt;
+      return this;
     }
 
     /**

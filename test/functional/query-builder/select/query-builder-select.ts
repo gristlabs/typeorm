@@ -95,4 +95,16 @@ describe("query builder > select", () => {
         expect(sql).to.equal("SELECT post.name FROM post post");
     })));
 
+    it("should allow a prefix for e.g. CTEs", () => Promise.all(connections.map(async connection => {
+        const sql = connection.createQueryBuilder(Post, "post")
+            .select(["post.title"])
+            .disableEscaping()
+            .prefix("WITH cnt(x) AS (VALUES(1),(2),(3))")
+            .where("post.id in (select * from cnt)")
+            .getSql();
+        expect(sql).to.equal("WITH cnt(x) AS (VALUES(1),(2),(3)) " +
+                             "SELECT post.title AS post_title FROM post post " +
+                             "WHERE post.id in (select * from cnt)");
+    })));
+
 });

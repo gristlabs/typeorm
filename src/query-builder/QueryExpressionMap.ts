@@ -117,6 +117,9 @@ export class QueryExpressionMap {
      */
     offset?: number;
 
+    // spot for a prefix, e.g. a CTE.
+    prefix?: string;
+
     /**
      * Number of rows to skip of result using pagination.
      */
@@ -398,6 +401,7 @@ export class QueryExpressionMap {
         map.callListeners = this.callListeners;
         map.useTransaction = this.useTransaction;
         map.nativeParameters = this.nativeParameters;
+        map.prefix = this.prefix;
         return map;
     }
 
