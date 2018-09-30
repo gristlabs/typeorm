@@ -120,6 +120,8 @@ export class QueryExpressionMap {
     // spot for a prefix, e.g. a CTE.
     prefix?: string;
 
+    distinct?: boolean;
+
     /**
      * Number of rows to skip of result using pagination.
      */

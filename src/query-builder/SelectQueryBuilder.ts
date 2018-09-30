@@ -49,7 +49,7 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
     getQuery(): string {
         let sql = "";
         if (this.expressionMap.prefix) {
-          sql += this.expressionMap.prefix;
+          sql += this.replacePropertyNames(this.expressionMap.prefix);
           sql += " ";
         }
         sql += this.createSelectExpression();
@@ -873,8 +873,14 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
         return this;
     }
 
-    prefix(txt: string) {
+    prefix(txt: string, parameters?: ObjectLiteral) {
       this.expressionMap.prefix = txt;
+      if (parameters) this.setParameters(parameters);
+      return this;
+    }
+
+    distinct() {
+      this.expressionMap.distinct = true;
       return this;
     }
 
@@ -1407,7 +1413,8 @@ export class SelectQueryBuilder<Entity> extends QueryBuilder<Entity> implements 
                 return this.getTableName(alias.tablePath!) + " " + this.escape(alias.name);
             });
         const selection = allSelects.map(select => select.selection + (select.aliasName ? " AS " + this.escape(select.aliasName) : "")).join(", ");
-        return "SELECT " + selection + " FROM " + froms.join(", ") + lock;
+        const distinctStr = this.expressionMap.distinct ? "DISTINCT " : "";
+        return "SELECT " + distinctStr + selection + " FROM " + froms.join(", ") + lock;
     }
 
     /**
