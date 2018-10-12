@@ -369,8 +369,8 @@ export class InsertQueryBuilder<Entity> extends QueryBuilder<Entity> {
                     //     expression += subQuery;
 
                     } else if (column.isDiscriminator) {
-                        this.expressionMap.nativeParameters["discriminator_value"] = this.expressionMap.mainAlias!.metadata.discriminatorValue;
-                        expression += this.connection.driver.createParameter("discriminator_value", parametersCount);
+                        this.expressionMap.nativeParameters["discriminator_value" + parametersCount] = this.expressionMap.mainAlias!.metadata.discriminatorValue;
+                        expression += this.connection.driver.createParameter("discriminator_value" + parametersCount, parametersCount);
                         parametersCount++;
                         // return "1";
 
