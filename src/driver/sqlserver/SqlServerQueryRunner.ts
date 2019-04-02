@@ -19,6 +19,7 @@ import {BaseQueryRunner} from "../../query-runner/BaseQueryRunner";
 import {Broadcaster} from "../../subscriber/Broadcaster";
 import {ColumnType, PromiseUtils} from "../../index";
 import {IsolationLevel} from "../types/IsolationLevel";
+import {TableExclusion} from "../../schema-builder/table/TableExclusion";
 
 /**
  * Runs queries on a single SQL Server database connection.
@@ -220,7 +221,15 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
                         return fail(new QueryFailedError(query, parameters, err));
                     }
 
-                    ok(result.recordset);
+                    const queryType = query.slice(0, query.indexOf(" "));
+                    switch (queryType) {
+                        case "DELETE":
+                            // for DELETE query additionally return number of affected rows
+                            ok([result.recordset, result.rowsAffected[0]]);
+                            break;
+                        default:
+                            ok(result.recordset);
+                    }
                     resolveChain();
                 });
 
@@ -1166,6 +1175,34 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
     }
 
     /**
+     * Creates a new exclusion constraint.
+     */
+    async createExclusionConstraint(tableOrName: Table|string, exclusionConstraint: TableExclusion): Promise<void> {
+        throw new Error(`SqlServer does not support exclusion constraints.`);
+    }
+
+    /**
+     * Creates a new exclusion constraints.
+     */
+    async createExclusionConstraints(tableOrName: Table|string, exclusionConstraints: TableExclusion[]): Promise<void> {
+        throw new Error(`SqlServer does not support exclusion constraints.`);
+    }
+
+    /**
+     * Drops exclusion constraint.
+     */
+    async dropExclusionConstraint(tableOrName: Table|string, exclusionOrName: TableExclusion|string): Promise<void> {
+        throw new Error(`SqlServer does not support exclusion constraints.`);
+    }
+
+    /**
+     * Drops exclusion constraints.
+     */
+    async dropExclusionConstraints(tableOrName: Table|string, exclusionConstraints: TableExclusion[]): Promise<void> {
+        throw new Error(`SqlServer does not support exclusion constraints.`);
+    }
+
+    /**
      * Creates a new foreign key.
      */
     async createForeignKey(tableOrName: Table|string, foreignKey: TableForeignKey): Promise<void> {
@@ -1426,7 +1463,7 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
                 `WHERE COLUMNPROPERTY(object_id("TABLE_CATALOG" + '.' + "TABLE_SCHEMA" + '.' + "TABLE_NAME"), "COLUMN_NAME", 'IsIdentity') = 1 AND "TABLE_SCHEMA" IN (${schemaNamesString})`;
         }).join(" UNION ALL ");
 
-        const dbCollationsSql = `SELECT "NAME", "COLLATION_NAME" FROM "SYS"."DATABASES"`;
+        const dbCollationsSql = `SELECT "NAME", "COLLATION_NAME" FROM "sys"."databases"`;
 
         const indicesSql = dbNames.map(dbName => {
             return `SELECT '${dbName}' AS "TABLE_CATALOG", "s"."name" AS "TABLE_SCHEMA", "t"."name" AS "TABLE_NAME", ` +
@@ -1516,6 +1553,28 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
                             tableColumn.scale = dbColumn["NUMERIC_SCALE"];
                     }
 
+                    if (tableColumn.type === "nvarchar") {
+                        // Check if this is an enum
+                        const columnCheckConstraints = columnConstraints.filter(constraint => constraint["CONSTRAINT_TYPE"] === "CHECK");
+                        if (columnCheckConstraints.length) {
+                            const isEnumRegexp = new RegExp("^\\(\\[" + tableColumn.name + "\\]='[^']+'(?: OR \\[" + tableColumn.name + "\\]='[^']+')*\\)$");
+                            for (const checkConstraint of columnCheckConstraints) {
+                                if (isEnumRegexp.test(checkConstraint["definition"])) {
+                                    // This is an enum constraint, make column into an enum
+                                    tableColumn.type = "simple-enum";
+                                    tableColumn.enum = [];
+                                    const enumValueRegexp = new RegExp("\\[" + tableColumn.name + "\\]='([^']+)'", "g");
+                                    let result;
+                                    while ((result = enumValueRegexp.exec(checkConstraint["definition"])) !== null) {
+                                        tableColumn.enum.unshift(result[1]);
+                                    }
+                                    // Skip other column constraints
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     tableColumn.default = dbColumn["COLUMN_DEFAULT"] !== null && dbColumn["COLUMN_DEFAULT"] !== undefined
                         ? this.removeParenthesisFromDefault(dbColumn["COLUMN_DEFAULT"])
                         : undefined;
@@ -1600,7 +1659,12 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
             }), dbIndex => dbIndex["INDEX_NAME"]);
 
             table.indices = tableIndexConstraints.map(constraint => {
-                const indices = dbIndices.filter(index => index["INDEX_NAME"] === constraint["INDEX_NAME"]);
+                const indices = dbIndices.filter(index => {
+                    return index["TABLE_CATALOG"] === constraint["TABLE_CATALOG"]
+                        && index["TABLE_SCHEMA"] === constraint["TABLE_SCHEMA"]
+                        && index["TABLE_NAME"] === constraint["TABLE_NAME"]
+                        && index["INDEX_NAME"] === constraint["INDEX_NAME"];
+                });
                 return new TableIndex(<TableIndexOptions>{
                     table: table,
                     name: constraint["INDEX_NAME"],
@@ -1694,7 +1758,7 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
      */
     protected createIndexSql(table: Table, index: TableIndex): string {
         const columns = index.columnNames.map(columnName => `"${columnName}"`).join(", ");
-        return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX "${index.name}" ON ${this.escapeTableName(table)}(${columns}) ${index.where ? "WHERE " + index.where : ""}`;
+        return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX "${index.name}" ON ${this.escapeTableName(table)} (${columns}) ${index.where ? "WHERE " + index.where : ""}`;
     }
 
     /**
@@ -1858,6 +1922,10 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
      */
     protected buildCreateColumnSql(table: Table, column: TableColumn, skipIdentity: boolean, createDefault: boolean) {
         let c = `"${column.name}" ${this.connection.driver.createFullType(column)}`;
+
+        if (column.enum)
+            c += " CHECK( " + column.name + " IN (" + column.enum.map(val => "'" + val + "'").join(",") + ") )";
+
         if (column.collation)
             c += " COLLATE " + column.collation;
 
@@ -1964,7 +2032,7 @@ export class SqlServerQueryRunner extends BaseQueryRunner implements QueryRunner
                 return ISOLATION_LEVEL.REPEATABLE_READ;
             case "SERIALIZABLE":
                 return ISOLATION_LEVEL.SERIALIZABLE;
-                
+
             case "READ COMMITTED":
             default:
                 return ISOLATION_LEVEL.READ_COMMITTED;
