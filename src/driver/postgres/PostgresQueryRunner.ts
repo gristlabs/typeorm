@@ -19,6 +19,7 @@ import {PromiseUtils} from "../../";
 import {TableCheck} from "../../schema-builder/table/TableCheck";
 import {ColumnType} from "../../index";
 import {IsolationLevel} from "../types/IsolationLevel";
+import {TableExclusion} from "../../schema-builder/table/TableExclusion";
 
 /**
  * Runs queries on a single postgres database connection.
@@ -174,7 +175,14 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                         this.driver.connection.logger.logQueryError(err, query, parameters, this);
                         fail(new QueryFailedError(query, parameters, err));
                     } else {
-                        ok(result.rows);
+                        switch (result.command) {
+                            case "DELETE":
+                                // for DELETE query additionally return number of affected rows
+                                ok([result.rows, result.rowCount]);
+                                break;
+                            default:
+                                ok(result.rows);
+                        }
                     }
                 });
 
@@ -305,7 +313,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
 
         // if table have column with ENUM type, we must create this type in postgres.
         await Promise.all(table.columns
-            .filter(column => column.type === "enum")
+            .filter(column => column.type === "enum" || column.type === "simple-enum")
             .map(async column => {
                 const hasEnum = await this.hasEnumType(table, column);
                 if (!hasEnum) {
@@ -441,7 +449,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
 
         // rename ENUM types
         newTable.columns
-            .filter(column => column.type === "enum")
+            .filter(column => column.type === "enum" || column.type === "simple-enum")
             .forEach(column => {
                 upQueries.push(`ALTER TYPE ${this.buildEnumName(oldTable, column)} RENAME TO ${this.buildEnumName(newTable, column, false)}`);
                 downQueries.push(`ALTER TYPE ${this.buildEnumName(newTable, column)} RENAME TO ${this.buildEnumName(oldTable, column, false)}`);
@@ -459,7 +467,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         const upQueries: string[] = [];
         const downQueries: string[] = [];
 
-        if (column.type === "enum") {
+        if (column.type === "enum" || column.type === "simple-enum") {
             const hasEnum = await this.hasEnumType(table, column);
             if (!hasEnum) {
                 upQueries.push(this.createEnumTypeSql(table, column));
@@ -569,7 +577,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 downQueries.push(`ALTER TABLE ${this.escapeTableName(table)} RENAME COLUMN "${newColumn.name}" TO "${oldColumn.name}"`);
 
                 // rename ENUM type
-                if (oldColumn.type === "enum") {
+                if (oldColumn.type === "enum" || oldColumn.type === "simple-enum") {
                     upQueries.push(`ALTER TYPE ${this.buildEnumName(table, oldColumn)} RENAME TO ${this.buildEnumName(table, newColumn, false)}`);
                     downQueries.push(`ALTER TYPE ${this.buildEnumName(table, newColumn)} RENAME TO ${this.buildEnumName(table, oldColumn, false)}`);
                 }
@@ -667,9 +675,14 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 downQueries.push(`ALTER TABLE ${this.escapeTableName(table)} ALTER COLUMN "${newColumn.name}" TYPE ${this.driver.createFullType(oldColumn)}`);
             }
 
-            if (newColumn.type === "enum" && oldColumn.type === "enum" && !OrmUtils.isArraysEqual(newColumn.enum!, oldColumn.enum!)) {
+            if (
+                (newColumn.type === "enum" || newColumn.type === "simple-enum")
+                && (oldColumn.type === "enum" || newColumn.type === "simple-enum")
+                && !OrmUtils.isArraysEqual(newColumn.enum!, oldColumn.enum!)
+            ) {
                 const enumName = this.buildEnumName(table, newColumn);
                 const enumNameWithoutSchema = this.buildEnumName(table, newColumn, false);
+                const arraySuffix = newColumn.isArray ? "[]" : "";
                 const oldEnumName = this.buildEnumName(table, newColumn, true, false, true);
                 const oldEnumNameWithoutSchema = this.buildEnumName(table, newColumn, false, false, true);
 
@@ -688,8 +701,8 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 }
 
                 // build column types
-                const upType = `${enumNameWithoutSchema} USING "${newColumn.name}"::"text"::${enumNameWithoutSchema}`;
-                const downType = `${oldEnumNameWithoutSchema} USING "${newColumn.name}"::"text"::${oldEnumNameWithoutSchema}`;
+                const upType = `${enumName}${arraySuffix} USING "${newColumn.name}"::"text"::${enumName}${arraySuffix}`;
+                const downType = `${oldEnumName}${arraySuffix} USING "${newColumn.name}"::"text"::${oldEnumName}${arraySuffix}`;
 
                 // update column to use new type
                 upQueries.push(`ALTER TABLE ${this.escapeTableName(table)} ALTER COLUMN "${newColumn.name}" TYPE ${upType}`);
@@ -892,7 +905,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         downQueries.push(`ALTER TABLE ${this.escapeTableName(table)} ADD ${this.buildCreateColumnSql(table, column)}`);
 
         // drop enum type
-        if (column.type === "enum") {
+        if (column.type === "enum" || column.type === "simple-enum") {
             const hasEnum = await this.hasEnumType(table, column);
             if (hasEnum) {
                 upQueries.push(this.dropEnumTypeSql(table, column));
@@ -1072,6 +1085,53 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
     }
 
     /**
+     * Creates new exclusion constraint.
+     */
+    async createExclusionConstraint(tableOrName: Table|string, exclusionConstraint: TableExclusion): Promise<void> {
+        const table = tableOrName instanceof Table ? tableOrName : await this.getCachedTable(tableOrName);
+
+        // new unique constraint may be passed without name. In this case we generate unique name manually.
+        if (!exclusionConstraint.name)
+            exclusionConstraint.name = this.connection.namingStrategy.exclusionConstraintName(table.name, exclusionConstraint.expression!);
+
+        const up = this.createExclusionConstraintSql(table, exclusionConstraint);
+        const down = this.dropExclusionConstraintSql(table, exclusionConstraint);
+        await this.executeQueries(up, down);
+        table.addExclusionConstraint(exclusionConstraint);
+    }
+
+    /**
+     * Creates new exclusion constraints.
+     */
+    async createExclusionConstraints(tableOrName: Table|string, exclusionConstraints: TableExclusion[]): Promise<void> {
+        const promises = exclusionConstraints.map(exclusionConstraint => this.createExclusionConstraint(tableOrName, exclusionConstraint));
+        await Promise.all(promises);
+    }
+
+    /**
+     * Drops exclusion constraint.
+     */
+    async dropExclusionConstraint(tableOrName: Table|string, exclusionOrName: TableExclusion|string): Promise<void> {
+        const table = tableOrName instanceof Table ? tableOrName : await this.getCachedTable(tableOrName);
+        const exclusionConstraint = exclusionOrName instanceof TableExclusion ? exclusionOrName : table.exclusions.find(c => c.name === exclusionOrName);
+        if (!exclusionConstraint)
+            throw new Error(`Supplied exclusion constraint was not found in table ${table.name}`);
+
+        const up = this.dropExclusionConstraintSql(table, exclusionConstraint);
+        const down = this.createExclusionConstraintSql(table, exclusionConstraint);
+        await this.executeQueries(up, down);
+        table.removeExclusionConstraint(exclusionConstraint);
+    }
+
+    /**
+     * Drops exclusion constraints.
+     */
+    async dropExclusionConstraints(tableOrName: Table|string, exclusionConstraints: TableExclusion[]): Promise<void> {
+        const promises = exclusionConstraints.map(exclusionConstraint => this.dropExclusionConstraint(tableOrName, exclusionConstraint));
+        await Promise.all(promises);
+    }
+
+    /**
      * Creates a new foreign key.
      */
     async createForeignKey(tableOrName: Table|string, foreignKey: TableForeignKey): Promise<void> {
@@ -1230,7 +1290,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             return `("table_schema" = '${schema}' AND "table_name" = '${name}')`;
         }).join(" OR ");
         const tablesSql = `SELECT * FROM "information_schema"."tables" WHERE ` + tablesCondition;
-        const columnsSql = `SELECT *, "udt_name"::"regtype" AS "regtype" FROM "information_schema"."columns" WHERE ` + tablesCondition;
+        const columnsSql = `SELECT *, ('"' || "udt_schema" || '"."' || "udt_name" || '"')::"regtype" AS "regtype" FROM "information_schema"."columns" WHERE ` + tablesCondition;
 
         const constraintsCondition = tableNames.map(tableName => {
             let [schema, name] = tableName.split(".");
@@ -1241,12 +1301,13 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             return `("ns"."nspname" = '${schema}' AND "t"."relname" = '${name}')`;
         }).join(" OR ");
 
-        const constraintsSql = `SELECT "ns"."nspname" AS "table_schema", "t"."relname" AS "table_name", "cnst"."conname" AS "constraint_name", "cnst"."consrc" AS "expression", ` +
-            `CASE "cnst"."contype" WHEN 'p' THEN 'PRIMARY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' END AS "constraint_type", "a"."attname" AS "column_name" ` +
+        const constraintsSql = `SELECT "ns"."nspname" AS "table_schema", "t"."relname" AS "table_name", "cnst"."conname" AS "constraint_name", ` +
+            `CASE "cnst"."contype" WHEN 'x' THEN pg_get_constraintdef("cnst"."oid", true) ELSE "cnst"."consrc" END AS "expression", ` +
+            `CASE "cnst"."contype" WHEN 'p' THEN 'PRIMARY' WHEN 'u' THEN 'UNIQUE' WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE' END AS "constraint_type", "a"."attname" AS "column_name" ` +
             `FROM "pg_constraint" "cnst" ` +
             `INNER JOIN "pg_class" "t" ON "t"."oid" = "cnst"."conrelid" ` +
             `INNER JOIN "pg_namespace" "ns" ON "ns"."oid" = "cnst"."connamespace" ` +
-            `INNER JOIN "pg_attribute" "a" ON "a"."attrelid" = "cnst"."conrelid" AND "a"."attnum" = ANY ("cnst"."conkey") ` +
+            `LEFT JOIN "pg_attribute" "a" ON "a"."attrelid" = "cnst"."conrelid" AND "a"."attnum" = ANY ("cnst"."conkey") ` +
             `WHERE "t"."relkind" = 'r' AND (${constraintsCondition})`;
 
         const indicesSql = `SELECT "ns"."nspname" AS "table_schema", "t"."relname" AS "table_name", "i"."relname" AS "constraint_name", "a"."attname" AS "column_name", ` +
@@ -1270,9 +1331,12 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             return `("ns"."nspname" = '${schema}' AND "cl"."relname" = '${name}')`;
         }).join(" OR ");
         const foreignKeysSql = `SELECT "con"."conname" AS "constraint_name", "con"."nspname" AS "table_schema", "con"."relname" AS "table_name", "att2"."attname" AS "column_name", ` +
-            `"ns"."nspname" AS "referenced_table_schema", "cl"."relname" AS "referenced_table_name", "att"."attname" AS "referenced_column_name", "con"."confdeltype" AS "on_delete", "con"."confupdtype" AS "on_update" ` +
+            `"ns"."nspname" AS "referenced_table_schema", "cl"."relname" AS "referenced_table_name", "att"."attname" AS "referenced_column_name", "con"."confdeltype" AS "on_delete", ` +
+            `"con"."confupdtype" AS "on_update", "con"."condeferrable" AS "deferrable", "con"."condeferred" AS "deferred" ` +
             `FROM ( ` +
-            `SELECT UNNEST ("con1"."conkey") AS "parent", UNNEST ("con1"."confkey") AS "child", "con1"."confrelid", "con1"."conrelid", "con1"."conname", "con1"."contype", "ns"."nspname", "cl"."relname", ` +
+            `SELECT UNNEST ("con1"."conkey") AS "parent", UNNEST ("con1"."confkey") AS "child", "con1"."confrelid", "con1"."conrelid", "con1"."conname", "con1"."contype", "ns"."nspname", ` + 
+            `"cl"."relname", "con1"."condeferrable", ` + 
+            `CASE WHEN "con1"."condeferred" THEN 'INITIALLY DEFERRED' ELSE 'INITIALLY IMMEDIATE' END as condeferred, ` +
             `CASE "con1"."confdeltype" WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END as "confdeltype", ` +
             `CASE "con1"."confupdtype" WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END as "confupdtype" ` +
             `FROM "pg_class" "cl" ` +
@@ -1361,14 +1425,14 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                     if (tableColumn.type === "geometry") {
                       const geometryColumnSql = `SELECT * FROM (
                         SELECT
-                          f_table_schema table_schema,
-                          f_table_name table_name,
-                          f_geometry_column column_name,
-                          srid,
-                          type
-                        FROM geometry_columns
+                          "f_table_schema" "table_schema",
+                          "f_table_name" "table_name",
+                          "f_geometry_column" "column_name",
+                          "srid",
+                          "type"
+                        FROM "geometry_columns"
                       ) AS _
-                      WHERE ${tablesCondition} AND column_name = '${tableColumn.name}'`;
+                      WHERE ${tablesCondition} AND "column_name" = '${tableColumn.name}'`;
 
                       const results: ObjectLiteral[] = await this.query(geometryColumnSql);
                       tableColumn.spatialFeatureType = results[0].type;
@@ -1378,14 +1442,14 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                     if (tableColumn.type === "geography") {
                       const geographyColumnSql = `SELECT * FROM (
                         SELECT
-                          f_table_schema table_schema,
-                          f_table_name table_name,
-                          f_geography_column column_name,
-                          srid,
-                          type
-                        FROM geography_columns
+                          "f_table_schema" "table_schema",
+                          "f_table_name" "table_name",
+                          "f_geography_column" "column_name",
+                          "srid",
+                          "type"
+                        FROM "geography_columns"
                       ) AS _
-                      WHERE ${tablesCondition} AND column_name = '${tableColumn.name}'`;
+                      WHERE ${tablesCondition} AND "column_name" = '${tableColumn.name}'`;
 
                       const results: ObjectLiteral[] = await this.query(geographyColumnSql);
                       tableColumn.spatialFeatureType = results[0].type;
@@ -1412,11 +1476,9 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                         if (dbColumn["column_default"].replace(/"/gi, "") === `nextval('${this.buildSequenceName(table, dbColumn["column_name"], currentSchema, true)}'::regclass)`) {
                             tableColumn.isGenerated = true;
                             tableColumn.generationStrategy = "increment";
-
-                        } else if (/^uuid_generate_v\d\(\)/.test(dbColumn["column_default"])) {
+                        } else if (dbColumn["column_default"] === "gen_random_uuid()" || /^uuid_generate_v\d\(\)/.test(dbColumn["column_default"])) {
                             tableColumn.isGenerated = true;
                             tableColumn.generationStrategy = "uuid";
-
                         } else {
                             tableColumn.default = dbColumn["column_default"].replace(/::.*/, "");
                         }
@@ -1459,6 +1521,19 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 });
             });
 
+            // find exclusion constraints of table, group them by constraint name and build TableExclusion.
+            const tableExclusionConstraints = OrmUtils.uniq(dbConstraints.filter(dbConstraint => {
+                return this.driver.buildTableName(dbConstraint["table_name"], dbConstraint["table_schema"]) === tableFullName
+                    && dbConstraint["constraint_type"] === "EXCLUDE";
+            }), dbConstraint => dbConstraint["constraint_name"]);
+
+            table.exclusions = tableExclusionConstraints.map(constraint => {
+                return new TableExclusion({
+                    name: constraint["constraint_name"],
+                    expression: constraint["expression"].substring(8) // trim EXCLUDE from start of expression
+                });
+            });
+
             // find foreign key constraints of table, group them by constraint name and build TableForeignKey.
             const tableForeignKeyConstraints = OrmUtils.uniq(dbForeignKeys.filter(dbForeignKey => {
                 return this.driver.buildTableName(dbForeignKey["table_name"], dbForeignKey["table_schema"]) === tableFullName;
@@ -1477,7 +1552,8 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                     referencedTableName: referencedTableName,
                     referencedColumnNames: foreignKeys.map(dbFk => dbFk["referenced_column_name"]),
                     onDelete: dbForeignKey["on_delete"],
-                    onUpdate: dbForeignKey["on_update"]
+                    onUpdate: dbForeignKey["on_update"],
+                    deferrable: dbForeignKey["deferrable"] ? dbForeignKey["deferred"] : undefined,
                 });
             });
 
@@ -1487,7 +1563,11 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             }), dbIndex => dbIndex["constraint_name"]);
 
             table.indices = tableIndexConstraints.map(constraint => {
-                const indices = dbIndices.filter(index => index["constraint_name"] === constraint["constraint_name"]);
+                const indices = dbIndices.filter(index => {
+                    return index["table_schema"] === constraint["table_schema"]
+                        && index["table_name"] === constraint["table_name"]
+                        && index["constraint_name"] === constraint["constraint_name"];
+                });
                 return new TableIndex(<TableIndexOptions>{
                     table: table,
                     name: constraint["constraint_name"],
@@ -1540,6 +1620,15 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             sql += `, ${checksSql}`;
         }
 
+        if (table.exclusions.length > 0) {
+            const exclusionsSql = table.exclusions.map(exclusion => {
+                const exclusionName = exclusion.name ? exclusion.name : this.connection.namingStrategy.exclusionConstraintName(table.name, exclusion.expression!);
+                return `CONSTRAINT "${exclusionName}" EXCLUDE ${exclusion.expression}`;
+            }).join(", ");
+
+            sql += `, ${exclusionsSql}`;
+        }
+
         if (table.foreignKeys.length > 0 && createForeignKeys) {
             const foreignKeysSql = table.foreignKeys.map(fk => {
                 const columnNames = fk.columnNames.map(columnName => `"${columnName}"`).join(", ");
@@ -1552,6 +1641,8 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                     constraint += ` ON DELETE ${fk.onDelete}`;
                 if (fk.onUpdate)
                     constraint += ` ON UPDATE ${fk.onUpdate}`;
+                if (fk.deferrable)
+                    constraint += ` DEFERRABLE ${fk.deferrable}`;
 
                 return constraint;
             }).join(", ");
@@ -1635,7 +1726,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
      */
     protected createIndexSql(table: Table, index: TableIndex): string {
         const columns = index.columnNames.map(columnName => `"${columnName}"`).join(", ");
-        return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX "${index.name}" ON ${this.escapeTableName(table)} ${index.isSpatial ? "USING GiST " : ""} (${columns}) ${index.where ? "WHERE " + index.where : ""}`;
+        return `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX "${index.name}" ON ${this.escapeTableName(table)} ${index.isSpatial ? "USING GiST " : ""}(${columns}) ${index.where ? "WHERE " + index.where : ""}`;
     }
 
     /**
@@ -1697,6 +1788,21 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
     }
 
     /**
+     * Builds create exclusion constraint sql.
+     */
+    protected createExclusionConstraintSql(table: Table, exclusionConstraint: TableExclusion): string {
+        return `ALTER TABLE ${this.escapeTableName(table)} ADD CONSTRAINT "${exclusionConstraint.name}" EXCLUDE ${exclusionConstraint.expression}`;
+    }
+
+    /**
+     * Builds drop exclusion constraint sql.
+     */
+    protected dropExclusionConstraintSql(table: Table, exclusionOrName: TableExclusion|string): string {
+        const exclusionName = exclusionOrName instanceof TableExclusion ? exclusionOrName.name : exclusionOrName;
+        return `ALTER TABLE ${this.escapeTableName(table)} DROP CONSTRAINT "${exclusionName}"`;
+    }
+
+    /**
      * Builds create foreign key sql.
      */
     protected createForeignKeySql(table: Table, foreignKey: TableForeignKey): string {
@@ -1708,6 +1814,8 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             sql += ` ON DELETE ${foreignKey.onDelete}`;
         if (foreignKey.onUpdate)
             sql += ` ON UPDATE ${foreignKey.onUpdate}`;
+        if (foreignKey.deferrable)
+            sql += ` DEFERRABLE ${foreignKey.deferrable}`;
 
         return sql;
     }
@@ -1750,12 +1858,12 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         const columnName = columnOrName instanceof TableColumn ? columnOrName.name : columnOrName;
         const schema = table.name.indexOf(".") === -1 ? this.driver.options.schema : table.name.split(".")[0];
         const tableName = table.name.indexOf(".") === -1 ? table.name : table.name.split(".")[1];
-        let enumName = schema && withSchema ? `${schema}.${tableName}_${columnName.toLowerCase()}_enum` : `${tableName}_${columnName.toLowerCase()}_enum`;
+        let enumName = schema && withSchema ? `${schema}.${tableName}_${columnName}_enum` : `${tableName}_${columnName}_enum`;
         if (toOld)
             enumName = enumName + "_old";
         return enumName.split(".").map(i => {
             return disableEscape ? i : `"${i}"`;
-        }).join(".");
+        }).join(".").toLowerCase();
     }
 
     /**
@@ -1801,8 +1909,8 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             if (column.type === "bigint" || column.type === "int8")
                 c += " BIGSERIAL";
         }
-        if (column.type === "enum") {
-            c += " " + this.buildEnumName(table, column, false);
+        if (column.type === "enum" || column.type === "simple-enum") {
+            c += " " + this.buildEnumName(table, column);
             if (column.isArray)
                 c += " array";
 
@@ -1818,7 +1926,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         if (column.default !== undefined && column.default !== null)
             c += " DEFAULT " + column.default;
         if (column.isGenerated && column.generationStrategy === "uuid" && !column.default)
-            c += " DEFAULT uuid_generate_v4()";
+            c += ` DEFAULT ${this.driver.uuidGenerator}`;
 
         return c;
     }
